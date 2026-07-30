@@ -1,0 +1,19 @@
+# Android / Gradle
+.gradle/
+**/build/
+local.properties
+*.iml
+.idea/
+
+# .NET
+**/bin/
+**/obj/
+dist/
+
+# Local receiver configuration and secrets
+bridge-config.json
+*.token
+
+# OS
+.DS_Store
+Thumbs.db

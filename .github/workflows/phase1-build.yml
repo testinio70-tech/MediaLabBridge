@@ -1,0 +1,94 @@
+name: Phase 1 Build
+
+on:
+  push:
+    branches: [main, "agent/**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  android-debug-apk:
+    name: Android debug APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v6
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android platform
+        run: sdkmanager "platforms;android-36" "build-tools;36.0.0"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v6
+        with:
+          gradle-version: "9.5.1"
+
+      - name: Build debug APK
+        run: gradle --no-daemon :app:assembleDebug
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: MediaLabBridge-Android-debug
+          path: app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          retention-days: 30
+
+  windows-receiver:
+    name: Windows receiver
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v6
+
+      - name: Set up .NET 10
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: "10.0.x"
+
+      - name: Restore
+        run: dotnet restore desktop/MediaLabBridge.Desktop/MediaLabBridge.Desktop.csproj
+
+      - name: Build
+        run: dotnet build desktop/MediaLabBridge.Desktop/MediaLabBridge.Desktop.csproj --configuration Release --no-restore
+
+      - name: Publish self-contained Windows executable
+        run: >-
+          dotnet publish desktop/MediaLabBridge.Desktop/MediaLabBridge.Desktop.csproj
+          --configuration Release
+          --runtime win-x64
+          --self-contained true
+          -p:PublishSingleFile=true
+          -p:DebugType=None
+          -p:DebugSymbols=false
+          --output dist/windows
+
+      - name: Add launchers and guide
+        run: |
+          cp desktop/start-copy-mode.cmd dist/windows/
+          cp desktop/start-execution-mode.cmd dist/windows/
+          cp desktop/README-WINDOWS.md dist/windows/
+          cp desktop/test-connection.ps1 dist/windows/
+
+      - name: Upload Windows receiver
+        uses: actions/upload-artifact@v4
+        with:
+          name: MediaLabBridge-Windows-win-x64
+          path: dist/windows/
+          if-no-files-found: error
+          retention-days: 30

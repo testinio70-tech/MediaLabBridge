@@ -1,4 +1,4 @@
-name: Phase 1 Build
+name: MediaLabBridge Build
 
 on:
   push:

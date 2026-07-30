@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Net;
 using System.Net.Sockets;
@@ -5,11 +6,10 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 
-const int MaxTextLength = 100_000;
-const int ExecutionTimeoutSeconds = 60;
-
 var options = BridgeOptions.Parse(args);
 var config = BridgeConfigStore.LoadOrCreate(options.Port, options.AllowExecution);
+var jobs = new ConcurrentDictionary<string, JobEntry>(StringComparer.Ordinal);
+var executionGate = new SemaphoreSlim(1, 1);
 
 var builder = WebApplication.CreateBuilder(args);
 builder.Logging.ClearProviders();
@@ -19,6 +19,12 @@ builder.Logging.AddSimpleConsole(settings =>
     settings.TimestampFormat = "HH:mm:ss ";
 });
 builder.WebHost.UseUrls($"http://{options.BindAddress}:{options.Port}");
+builder.WebHost.ConfigureKestrel(serverOptions =>
+{
+    serverOptions.Limits.MaxRequestBodySize = BridgeLimits.MaxRequestBodyBytes;
+    serverOptions.Limits.KeepAliveTimeout = TimeSpan.FromMinutes(5);
+    serverOptions.Limits.RequestHeadersTimeout = TimeSpan.FromSeconds(30);
+});
 
 var app = builder.Build();
 
@@ -49,95 +55,146 @@ app.Use(async (context, next) =>
 app.MapGet("/health", () => Results.Json(new
 {
     status = "ok",
-    version = "0.1.0",
+    version = BridgeLimits.AppVersion,
     executionEnabled = options.AllowExecution,
-    port = options.Port
+    port = options.Port,
+    maxTextLength = BridgeLimits.MaxTextLength,
+    defaultTimeoutSeconds = BridgeLimits.DefaultExecutionTimeoutSeconds,
+    maxTimeoutSeconds = BridgeLimits.MaxExecutionTimeoutSeconds,
+    powerShell = PowerShellLocator.Describe()
 }));
 
-app.MapPost("/api/v1/command", async (CommandRequest request, ILogger<Program> logger, CancellationToken cancellationToken) =>
+app.MapGet("/api/v1/jobs/{requestId}", async (string requestId) =>
 {
-    var requestId = string.IsNullOrWhiteSpace(request.RequestId)
-        ? Guid.NewGuid().ToString()
-        : request.RequestId.Trim();
+    requestId = RequestTools.NormalizeRequestId(requestId);
+    if (!jobs.TryGetValue(requestId, out var entry))
+    {
+        return Results.NotFound(new
+        {
+            ok = false,
+            requestId,
+            state = "not-found",
+            error = "No se encontró ese trabajo."
+        });
+    }
+
+    if (!entry.Task.IsCompleted)
+    {
+        return Results.Json(new
+        {
+            ok = true,
+            requestId,
+            state = "running",
+            createdUtc = entry.CreatedUtc
+        }, statusCode: StatusCodes.Status202Accepted);
+    }
+
+    var completed = await entry.Task;
+    return Results.Json(completed.Body, statusCode: completed.StatusCode);
+});
+
+app.MapPost("/api/v1/command", async (CommandRequest request, ILogger<Program> logger) =>
+{
+    var requestId = RequestTools.NormalizeRequestId(request.RequestId);
 
     if (string.IsNullOrWhiteSpace(request.Text))
     {
         return Results.BadRequest(new { ok = false, requestId, error = "El texto está vacío." });
     }
 
-    if (request.Text.Length > MaxTextLength)
+    if (request.Text.Length > BridgeLimits.MaxTextLength)
     {
         return Results.BadRequest(new
         {
             ok = false,
             requestId,
-            error = $"El texto supera el límite de {MaxTextLength} caracteres."
+            error = $"El texto supera el límite de {BridgeLimits.MaxTextLength:N0} caracteres."
         });
     }
 
-    logger.LogInformation("Solicitud {RequestId}: acción={Action}, origen={RemoteIp}",
-        requestId,
-        request.Action,
-        "red-local");
-
-    switch (request.Action?.Trim().ToLowerInvariant())
+    var action = request.Action?.Trim().ToLowerInvariant();
+    if (action is not ("copy" or "execute"))
     {
-        case "copy":
+        return Results.BadRequest(new
         {
-            var result = await BridgeActions.CopyToClipboardAsync(request.Text, cancellationToken);
-            return result.Success
-                ? Results.Ok(new { ok = true, requestId, action = "copy", message = "Texto copiado al portapapeles del PC." })
-                : Results.Json(new { ok = false, requestId, error = result.Error }, statusCode: 500);
-        }
+            ok = false,
+            requestId,
+            error = "Acción no válida. Usa 'copy' o 'execute'."
+        });
+    }
 
-        case "execute":
+    if (action == "execute" && !options.AllowExecution)
+    {
+        return Results.Json(new
         {
-            if (!options.AllowExecution)
-            {
-                return Results.Json(new
-                {
-                    ok = false,
-                    requestId,
-                    error = "La ejecución está desactivada. Inicia el receptor con --allow-execution para habilitarla de forma explícita."
-                }, statusCode: 403);
-            }
+            ok = false,
+            requestId,
+            error = "La ejecución está desactivada. Inicia el receptor con --allow-execution para habilitarla de forma explícita."
+        }, statusCode: StatusCodes.Status403Forbidden);
+    }
 
-            var result = await BridgeActions.ExecutePowerShellAsync(
-                request.Text,
-                TimeSpan.FromSeconds(ExecutionTimeoutSeconds),
-                cancellationToken);
-
-            return Results.Json(new
-            {
-                ok = result.ExitCode == 0,
-                requestId,
-                action = "execute",
-                exitCode = result.ExitCode,
-                stdout = result.StandardOutput,
-                stderr = result.StandardError,
-                timedOut = result.TimedOut
-            }, statusCode: result.TimedOut ? 408 : 200);
-        }
-
-        default:
+    var timeoutSeconds = RequestTools.ResolveTimeoutSeconds(request.TimeoutSeconds);
+    string? workingDirectory = null;
+    if (action == "execute")
+    {
+        var directoryResult = RequestTools.ResolveWorkingDirectory(request.WorkingDirectory);
+        if (!directoryResult.Success)
+        {
             return Results.BadRequest(new
             {
                 ok = false,
                 requestId,
-                error = "Acción no válida. Usa 'copy' o 'execute'."
+                error = directoryResult.Error
             });
+        }
+        workingDirectory = directoryResult.Path;
     }
+
+    var payloadHash = RequestTools.ComputePayloadHash(action, request.Text, timeoutSeconds, workingDirectory);
+    var newEntry = new JobEntry(
+        payloadHash,
+        DateTimeOffset.UtcNow,
+        () => ProcessCommandAsync(
+            requestId,
+            action,
+            request.Text,
+            timeoutSeconds,
+            workingDirectory,
+            executionGate,
+            logger));
+
+    var entry = jobs.GetOrAdd(requestId, newEntry);
+    if (!string.Equals(entry.PayloadHash, payloadHash, StringComparison.Ordinal))
+    {
+        return Results.Json(new
+        {
+            ok = false,
+            requestId,
+            error = "El identificador de solicitud ya existe con un contenido diferente."
+        }, statusCode: StatusCodes.Status409Conflict);
+    }
+
+    if (ReferenceEquals(entry, newEntry))
+    {
+        _ = RemoveCompletedJobLaterAsync(requestId, entry, jobs);
+    }
+
+    var completed = await entry.Task;
+    return Results.Json(completed.Body, statusCode: completed.StatusCode);
 });
 
 app.Lifetime.ApplicationStarted.Register(() =>
 {
     Console.WriteLine();
     Console.WriteLine("============================================================");
-    Console.WriteLine(" MediaLabBridge Desktop 0.1.0");
+    Console.WriteLine($" MediaLabBridge Desktop {BridgeLimits.AppVersion}");
     Console.WriteLine("============================================================");
     Console.WriteLine($" Token: {config.Token}");
     Console.WriteLine($" Puerto: {options.Port}");
     Console.WriteLine($" Ejecución PowerShell: {(options.AllowExecution ? "HABILITADA" : "DESACTIVADA")}");
+    Console.WriteLine($" Motor preferido: {PowerShellLocator.Describe()}");
+    Console.WriteLine($" Capacidad máxima: {BridgeLimits.MaxTextLength:N0} caracteres por script");
+    Console.WriteLine($" Tiempo máximo: {BridgeLimits.MaxExecutionTimeoutSeconds / 60} minutos");
     Console.WriteLine(" Direcciones sugeridas para la APK:");
     foreach (var address in NetworkTools.GetLocalIpv4Addresses())
     {
@@ -152,232 +209,106 @@ app.Lifetime.ApplicationStarted.Register(() =>
 
 await app.RunAsync();
 
-internal sealed record CommandRequest(string? RequestId, string? Action, string Text);
-
-internal sealed record BridgeOptions(string BindAddress, int Port, bool AllowExecution)
+static async Task<CachedResponse> ProcessCommandAsync(
+    string requestId,
+    string action,
+    string text,
+    int timeoutSeconds,
+    string? workingDirectory,
+    SemaphoreSlim executionGate,
+    ILogger logger)
 {
-    public static BridgeOptions Parse(string[] args)
+    logger.LogInformation(
+        "Solicitud {RequestId}: acción={Action}, caracteres={Length}, timeout={TimeoutSeconds}s",
+        requestId,
+        action,
+        text.Length,
+        timeoutSeconds);
+
+    if (action == "copy")
     {
-        var bind = "0.0.0.0";
-        var port = 8765;
-        var allowExecution = false;
+        var result = await BridgeActions.CopyToClipboardAsync(text, CancellationToken.None);
+        var body = new CommandResponse(
+            result.Success,
+            requestId,
+            "copy",
+            result.Success ? "completed" : "failed",
+            result.Success ? "Texto copiado al portapapeles del PC." : null,
+            result.Error,
+            null,
+            null,
+            null,
+            false,
+            false,
+            0,
+            null,
+            null,
+            text.Length);
+        return new CachedResponse(body, result.Success ? StatusCodes.Status200OK : StatusCodes.Status500InternalServerError);
+    }
 
-        for (var index = 0; index < args.Length; index++)
-        {
-            switch (args[index])
-            {
-                case "--bind" when index + 1 < args.Length:
-                    bind = args[++index];
-                    break;
-                case "--port" when index + 1 < args.Length && int.TryParse(args[++index], out var parsedPort):
-                    port = parsedPort;
-                    break;
-                case "--allow-execution":
-                    allowExecution = true;
-                    break;
-                case "--help":
-                case "-h":
-                    Console.WriteLine("MediaLabBridge.Desktop [--bind 0.0.0.0] [--port 8765] [--allow-execution]");
-                    Environment.Exit(0);
-                    break;
-            }
-        }
+    await executionGate.WaitAsync();
+    try
+    {
+        var stopwatch = Stopwatch.StartNew();
+        var result = await BridgeActions.ExecutePowerShellAsync(
+            text,
+            TimeSpan.FromSeconds(timeoutSeconds),
+            workingDirectory!,
+            BridgeLimits.MaxOutputCharacters);
+        stopwatch.Stop();
 
-        if (port is < 1 or > 65535)
-        {
-            throw new ArgumentOutOfRangeException(nameof(port), "El puerto debe estar entre 1 y 65535.");
-        }
+        var body = new CommandResponse(
+            result.ExitCode == 0 && !result.TimedOut,
+            requestId,
+            "execute",
+            result.TimedOut ? "timed-out" : "completed",
+            null,
+            result.TimedOut ? $"La ejecución superó {timeoutSeconds} segundos." : null,
+            result.ExitCode,
+            result.StandardOutput,
+            result.StandardError,
+            result.TimedOut,
+            result.OutputTruncated,
+            stopwatch.ElapsedMilliseconds,
+            result.Engine,
+            workingDirectory,
+            text.Length);
 
-        return new BridgeOptions(bind, port, allowExecution);
+        return new CachedResponse(
+            body,
+            result.TimedOut ? StatusCodes.Status408RequestTimeout : StatusCodes.Status200OK);
+    }
+    finally
+    {
+        executionGate.Release();
     }
 }
 
-internal sealed record BridgeConfig(string Token, int Port, bool ExecutionEnabled, DateTimeOffset CreatedUtc);
-
-internal static class BridgeConfigStore
+static async Task RemoveCompletedJobLaterAsync(
+    string requestId,
+    JobEntry entry,
+    ConcurrentDictionary<string, JobEntry> jobs)
 {
-    public static BridgeConfig LoadOrCreate(int port, bool executionEnabled)
+    try
     {
-        var folder = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-            "MediaLabBridge");
-        Directory.CreateDirectory(folder);
-
-        var path = Path.Combine(folder, "bridge-config.json");
-        if (File.Exists(path))
-        {
-            try
-            {
-                var existing = JsonSerializer.Deserialize<BridgeConfig>(File.ReadAllText(path));
-                if (existing is not null && !string.IsNullOrWhiteSpace(existing.Token))
-                {
-                    var updated = existing with { Port = port, ExecutionEnabled = executionEnabled };
-                    Save(path, updated);
-                    return updated;
-                }
-            }
-            catch (JsonException)
-            {
-                // A damaged local config is replaced with a fresh token.
-            }
-        }
-
-        var created = new BridgeConfig(
-            TokenTools.GenerateToken(),
-            port,
-            executionEnabled,
-            DateTimeOffset.UtcNow);
-        Save(path, created);
-        return created;
+        await entry.Task;
+        await Task.Delay(TimeSpan.FromMinutes(30));
+        RemoveIfCurrent(requestId, entry, jobs);
     }
-
-    private static void Save(string path, BridgeConfig config)
+    catch
     {
-        var json = JsonSerializer.Serialize(config, new JsonSerializerOptions { WriteIndented = true });
-        File.WriteAllText(path, json);
+        RemoveIfCurrent(requestId, entry, jobs);
     }
 }
 
-internal static class TokenTools
+static void RemoveIfCurrent(
+    string requestId,
+    JobEntry entry,
+    ConcurrentDictionary<string, JobEntry> jobs)
 {
-    public static string GenerateToken() => Convert.ToHexString(RandomNumberGenerator.GetBytes(32)).ToLowerInvariant();
-
-    public static bool FixedTimeEquals(string expected, string supplied)
+    if (jobs.TryGetValue(requestId, out var current) && ReferenceEquals(current, entry))
     {
-        var expectedBytes = Encoding.UTF8.GetBytes(expected);
-        var suppliedBytes = Encoding.UTF8.GetBytes(supplied);
-        return expectedBytes.Length == suppliedBytes.Length &&
-               CryptographicOperations.FixedTimeEquals(expectedBytes, suppliedBytes);
-    }
-}
-
-internal static class NetworkTools
-{
-    public static IReadOnlyList<string> GetLocalIpv4Addresses()
-    {
-        try
-        {
-            return Dns.GetHostEntry(Dns.GetHostName())
-                .AddressList
-                .Where(address => address.AddressFamily == AddressFamily.InterNetwork && !IPAddress.IsLoopback(address))
-                .Select(address => address.ToString())
-                .Distinct()
-                .OrderBy(address => address)
-                .ToArray();
-        }
-        catch (SocketException)
-        {
-            return Array.Empty<string>();
-        }
-    }
-}
-
-internal sealed record ClipboardResult(bool Success, string? Error);
-internal sealed record PowerShellResult(int ExitCode, string StandardOutput, string StandardError, bool TimedOut);
-
-internal static class BridgeActions
-{
-    public static async Task<ClipboardResult> CopyToClipboardAsync(string text, CancellationToken cancellationToken)
-    {
-        if (!OperatingSystem.IsWindows())
-        {
-            return new ClipboardResult(false, "El portapapeles solo está disponible en la compilación de Windows.");
-        }
-
-        try
-        {
-            using var process = new Process
-            {
-                StartInfo = new ProcessStartInfo
-                {
-                    FileName = "clip.exe",
-                    UseShellExecute = false,
-                    RedirectStandardInput = true,
-                    RedirectStandardOutput = true,
-                    RedirectStandardError = true,
-                    CreateNoWindow = true
-                }
-            };
-
-            process.Start();
-            await process.StandardInput.WriteAsync(text.AsMemory(), cancellationToken);
-            process.StandardInput.Close();
-            await process.WaitForExitAsync(cancellationToken);
-
-            if (process.ExitCode != 0)
-            {
-                var error = await process.StandardError.ReadToEndAsync(cancellationToken);
-                return new ClipboardResult(false, string.IsNullOrWhiteSpace(error) ? "clip.exe devolvió un error." : error);
-            }
-
-            return new ClipboardResult(true, null);
-        }
-        catch (Exception error) when (error is not OperationCanceledException)
-        {
-            return new ClipboardResult(false, error.Message);
-        }
-    }
-
-    public static async Task<PowerShellResult> ExecutePowerShellAsync(
-        string command,
-        TimeSpan timeout,
-        CancellationToken cancellationToken)
-    {
-        if (!OperatingSystem.IsWindows())
-        {
-            return new PowerShellResult(-1, string.Empty, "PowerShell solo se ejecuta en Windows.", false);
-        }
-
-        using var process = new Process
-        {
-            StartInfo = new ProcessStartInfo
-            {
-                FileName = "powershell.exe",
-                UseShellExecute = false,
-                RedirectStandardOutput = true,
-                RedirectStandardError = true,
-                RedirectStandardInput = false,
-                CreateNoWindow = true
-            }
-        };
-        process.StartInfo.ArgumentList.Add("-NoLogo");
-        process.StartInfo.ArgumentList.Add("-NoProfile");
-        process.StartInfo.ArgumentList.Add("-NonInteractive");
-        process.StartInfo.ArgumentList.Add("-Command");
-        process.StartInfo.ArgumentList.Add(command);
-
-        process.Start();
-        var stdoutTask = process.StandardOutput.ReadToEndAsync(cancellationToken);
-        var stderrTask = process.StandardError.ReadToEndAsync(cancellationToken);
-
-        using var timeoutSource = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        timeoutSource.CancelAfter(timeout);
-
-        try
-        {
-            await process.WaitForExitAsync(timeoutSource.Token);
-            return new PowerShellResult(
-                process.ExitCode,
-                await stdoutTask,
-                await stderrTask,
-                false);
-        }
-        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
-        {
-            try
-            {
-                process.Kill(entireProcessTree: true);
-            }
-            catch (InvalidOperationException)
-            {
-                // Process already stopped.
-            }
-
-            return new PowerShellResult(
-                -1,
-                await stdoutTask,
-                await stderrTask,
-                true);
-        }
+        jobs.TryRemove(requestId, out _);
     }
 }

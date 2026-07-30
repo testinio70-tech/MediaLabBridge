@@ -95,3 +95,144 @@ jobs:
           path: dist/windows/
           if-no-files-found: error
           retention-days: 30
+
+  windows-large-script-smoke-test:
+    name: Windows large-script smoke test
+    runs-on: windows-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v6
+
+      - name: Set up .NET 10
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: "10.0.x"
+
+      - name: Execute a 250k-character PowerShell job
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $port = 8876
+          $stdoutLog = Join-Path $env:RUNNER_TEMP 'bridge-server.stdout.log'
+          $stderrLog = Join-Path $env:RUNNER_TEMP 'bridge-server.stderr.log'
+          $countFile = Join-Path $env:RUNNER_TEMP 'bridge-run-count.txt'
+          Remove-Item $countFile -Force -ErrorAction SilentlyContinue
+
+          $server = Start-Process -FilePath dotnet -ArgumentList @(
+            'run',
+            '--project', 'desktop/MediaLabBridge.Desktop/MediaLabBridge.Desktop.csproj',
+            '--',
+            '--allow-execution',
+            '--bind', '127.0.0.1',
+            '--port', $port
+          ) -PassThru -RedirectStandardOutput $stdoutLog -RedirectStandardError $stderrLog
+
+          try {
+            $healthUrl = "http://127.0.0.1:$port/health"
+            $ready = $false
+            for ($attempt = 0; $attempt -lt 90; $attempt++) {
+              try {
+                $health = Invoke-RestMethod -Uri $healthUrl -TimeoutSec 2
+                if ($health.status -eq 'ok') {
+                  $ready = $true
+                  break
+                }
+              } catch {
+                Start-Sleep -Seconds 1
+              }
+            }
+            if (-not $ready) {
+              throw 'The receiver did not become ready.'
+            }
+
+            $configPath = Join-Path $env:LOCALAPPDATA 'MediaLabBridge\bridge-config.json'
+            $token = (Get-Content $configPath -Raw | ConvertFrom-Json).Token
+            if ([string]::IsNullOrWhiteSpace($token)) {
+              throw 'The receiver token was not created.'
+            }
+
+            $largeComment = '#' + ('x' * 250000)
+            $script = $largeComment + "`n" + @'
+          $countPath = Join-Path (Get-Location) 'bridge-run-count.txt'
+          $count = if (Test-Path $countPath) { [int](Get-Content $countPath -Raw) } else { 0 }
+          $count++
+          Set-Content -Path $countPath -Value $count -NoNewline
+          function Invoke-BridgeSmokeTest {
+              param([string]$Value)
+              "BRIDGE-LARGE-SCRIPT-$Value"
+          }
+          Invoke-BridgeSmokeTest -Value 'OK'
+          'Unicode: conexión estable'
+          "WorkingDirectory: $((Get-Location).Path)"
+          "RunCount: $count"
+          '@
+
+            if ($script.Length -le 100000) {
+              throw "The smoke script is not larger than the old limit: $($script.Length)"
+            }
+
+            $requestId = "ci-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+            $payload = @{
+              requestId = $requestId
+              action = 'execute'
+              text = $script
+              timeoutSeconds = 120
+              workingDirectory = $env:RUNNER_TEMP
+            } | ConvertTo-Json -Compress
+            $headers = @{ Authorization = "Bearer $token" }
+            $commandUrl = "http://127.0.0.1:$port/api/v1/command"
+
+            $invokeArgs = @{
+              Method = 'Post'
+              Uri = $commandUrl
+              Headers = $headers
+              ContentType = 'application/json; charset=utf-8'
+              Body = $payload
+              TimeoutSec = 180
+            }
+            $result = Invoke-RestMethod @invokeArgs
+
+            if (-not $result.ok -or $result.exitCode -ne 0) {
+              throw "Large script failed: $($result | ConvertTo-Json -Depth 8)"
+            }
+            if ($result.stdout -notmatch 'BRIDGE-LARGE-SCRIPT-OK') {
+              throw "Expected marker was not returned: $($result.stdout)"
+            }
+            if ($result.stdout -notmatch 'Unicode: conexión estable') {
+              throw "UTF-8 output was not preserved: $($result.stdout)"
+            }
+            if ($result.textLength -le 100000) {
+              throw "Server reported an unexpected script size: $($result.textLength)"
+            }
+
+            $cachedArgs = $invokeArgs.Clone()
+            $cachedArgs.TimeoutSec = 30
+            $cached = Invoke-RestMethod @cachedArgs
+            if ($cached.requestId -ne $requestId) {
+              throw 'The repeated request did not return the cached job.'
+            }
+
+            $runCount = [int](Get-Content $countFile -Raw)
+            if ($runCount -ne 1) {
+              throw "Duplicate execution detected. Run count: $runCount"
+            }
+
+            $job = Invoke-RestMethod -Uri "http://127.0.0.1:$port/api/v1/jobs/$requestId" -Headers $headers -TimeoutSec 30
+            if ($job.stdout -notmatch 'BRIDGE-LARGE-SCRIPT-OK') {
+              throw 'The completed job could not be recovered.'
+            }
+          } finally {
+            if ($server -and -not $server.HasExited) {
+              Stop-Process -Id $server.Id -Force -ErrorAction SilentlyContinue
+            }
+            if (Test-Path $stdoutLog) {
+              Write-Host '--- receiver stdout ---'
+              Get-Content $stdoutLog
+            }
+            if (Test-Path $stderrLog) {
+              Write-Host '--- receiver stderr ---'
+              Get-Content $stderrLog
+            }
+          }

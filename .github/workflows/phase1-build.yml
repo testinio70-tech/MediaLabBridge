@@ -1,4 +1,4 @@
-name: Phase 1 Build
+name: MediaLabBridge Build
 
 on:
   push:
@@ -35,6 +35,9 @@ jobs:
         uses: gradle/actions/setup-gradle@v6
         with:
           gradle-version: "9.5.1"
+
+      - name: Run Android unit tests
+        run: gradle --no-daemon :app:testDebugUnitTest
 
       - name: Build debug APK
         run: gradle --no-daemon :app:assembleDebug
